@@ -358,3 +358,150 @@ async def test_update_history_tick_boundary():
     inputs_msg = history_manager.history[0]
     assert "Updated reading" in inputs_msg.content
     assert "Initial reading" not in inputs_msg.content
+
+
+def test_save_and_load_history(history_manager, tmp_path, monkeypatch):
+    """Test saving and loading conversation history to/from disk."""
+    # Use a temporary directory for testing
+    test_history_dir = tmp_path / "history"
+    test_history_dir.mkdir()
+
+    # Mock the history file path to use our test directory
+    def mock_get_history_file_path(self):
+        return str(test_history_dir / "test_robot_history.json")
+
+    monkeypatch.setattr(
+        LLMHistoryManager, "_get_history_file_path", mock_get_history_file_path
+    )
+
+    # Add some messages to history
+    history_manager.history = [
+        ChatMessage(role="user", content="Hello robot"),
+        ChatMessage(role="assistant", content="Hello human"),
+        ChatMessage(role="user", content="How are you?"),
+        ChatMessage(role="assistant", content="I am functioning well"),
+    ]
+
+    # Save history
+    history_manager._save_history()
+
+    # Verify file was created
+    history_file = test_history_dir / "test_robot_history.json"
+    assert history_file.exists()
+
+    # Create a new history manager instance
+    new_manager = LLMHistoryManager(history_manager.config, history_manager.client)
+
+    # Load the saved history
+    new_manager._load_history()
+
+    # Verify loaded history matches original
+    assert len(new_manager.history) == 4
+    assert new_manager.history[0].role == "user"
+    assert new_manager.history[0].content == "Hello robot"
+    assert new_manager.history[1].role == "assistant"
+    assert new_manager.history[1].content == "Hello human"
+    assert new_manager.history[2].role == "user"
+    assert new_manager.history[2].content == "How are you?"
+    assert new_manager.history[3].role == "assistant"
+    assert new_manager.history[3].content == "I am functioning well"
+
+
+def test_load_history_file_not_exists(history_manager, tmp_path, monkeypatch):
+    """Test loading history when file doesn't exist."""
+    test_history_dir = tmp_path / "history"
+    test_history_dir.mkdir()
+
+    def mock_get_history_file_path(self):
+        return str(test_history_dir / "nonexistent_history.json")
+
+    monkeypatch.setattr(
+        LLMHistoryManager, "_get_history_file_path", mock_get_history_file_path
+    )
+
+    # Create new manager (will try to load non-existent file)
+    new_manager = LLMHistoryManager(history_manager.config, history_manager.client)
+
+    # Should have empty history
+    assert len(new_manager.history) == 0
+
+
+def test_load_history_invalid_json(history_manager, tmp_path, monkeypatch):
+    """Test loading history from invalid JSON file."""
+    test_history_dir = tmp_path / "history"
+    test_history_dir.mkdir()
+    history_file = test_history_dir / "invalid_history.json"
+
+    # Write invalid JSON
+    history_file.write_text("{ invalid json }")
+
+    def mock_get_history_file_path(self):
+        return str(history_file)
+
+    monkeypatch.setattr(
+        LLMHistoryManager, "_get_history_file_path", mock_get_history_file_path
+    )
+
+    # Create new manager (will try to load invalid file)
+    new_manager = LLMHistoryManager(history_manager.config, history_manager.client)
+
+    # Should have empty history (graceful failure)
+    assert len(new_manager.history) == 0
+
+
+def test_save_history_atomic_write(history_manager, tmp_path, monkeypatch):
+    """Test that save uses atomic write pattern (tmp file + rename)."""
+    import os
+
+    test_history_dir = tmp_path / "history"
+    test_history_dir.mkdir()
+    history_file_path = test_history_dir / "atomic_test_history.json"
+
+    def mock_get_history_file_path(self):
+        return str(history_file_path)
+
+    monkeypatch.setattr(
+        LLMHistoryManager, "_get_history_file_path", mock_get_history_file_path
+    )
+
+    # Add a message
+    history_manager.history = [ChatMessage(role="user", content="Test message")]
+
+    # Save history
+    history_manager._save_history()
+
+    # Verify final file exists
+    assert history_file_path.exists()
+
+    # Verify temp file doesn't exist (was renamed)
+    temp_file_path = test_history_dir / "atomic_test_history.json.tmp"
+    assert not temp_file_path.exists()
+
+    # Verify content is valid JSON
+    import json
+
+    with open(history_file_path) as f:
+        data = json.load(f)
+    assert len(data) == 1
+    assert data[0]["role"] == "user"
+    assert data[0]["content"] == "Test message"
+
+
+def test_history_file_path_sanitization(llm_config, openai_client):
+    """Test that agent names with special characters are sanitized for filenames."""
+    llm_config.agent_name = "Test/Robot:123*?"
+
+    manager = LLMHistoryManager(llm_config, openai_client)
+    path = manager._get_history_file_path()
+
+    # Verify path contains sanitized name
+    assert "Test_Robot_123__" in path
+    assert ".json" in path
+    # Verify no special characters that could cause filesystem issues
+    import os
+
+    filename = os.path.basename(path)
+    assert "/" not in filename
+    assert ":" not in filename
+    assert "*" not in filename
+    assert "?" not in filename

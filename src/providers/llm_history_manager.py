@@ -1,7 +1,9 @@
 import asyncio
 import functools
+import json
 import logging
-from dataclasses import dataclass
+import os
+from dataclasses import asdict, dataclass
 from typing import Any, Awaitable, Callable, List, Optional, TypeVar, Union
 
 import openai
@@ -87,6 +89,93 @@ class LLMHistoryManager:
 
         # io provider
         self.io_provider = IOProvider()
+
+        # Load conversation history from disk if it exists
+        self._load_history()
+
+    def _get_history_file_path(self) -> str:
+        """
+        Get the path to the conversation history file.
+
+        Returns
+        -------
+        str
+            The absolute path to the history file
+        """
+        history_folder_path = os.path.join(
+            os.path.dirname(__file__), "../../config", "history"
+        )
+        if not os.path.exists(history_folder_path):
+            os.makedirs(history_folder_path, mode=0o755, exist_ok=True)
+
+        agent_name = self.agent_name or "default"
+        # Sanitize agent name for use in filename
+        safe_agent_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in agent_name)
+        history_filename = f"{safe_agent_name}_history.json"
+
+        return os.path.join(history_folder_path, history_filename)
+
+    def _load_history(self):
+        """
+        Load the conversation history from disk if it exists.
+
+        If the history file exists and contains valid data, restore
+        the conversation history. Otherwise, start with an empty history.
+        """
+        history_file = self._get_history_file_path()
+
+        try:
+            if not os.path.exists(history_file):
+                logging.debug(f"No history file found at {history_file}, starting fresh")
+                return
+
+            with open(history_file, "r") as f:
+                history_data = json.load(f)
+
+            if not isinstance(history_data, list):
+                logging.warning("Invalid history file format: expected list")
+                return
+
+            # Restore history from saved data
+            self.history = [
+                ChatMessage(role=msg.get("role", ""), content=msg.get("content", ""))
+                for msg in history_data
+                if isinstance(msg, dict) and "role" in msg and "content" in msg
+            ]
+
+            logging.info(f"Loaded {len(self.history)} messages from history file")
+
+        except json.JSONDecodeError as e:
+            logging.warning(f"Invalid JSON in history file: {e}, starting fresh")
+        except Exception as e:
+            logging.error(f"Error loading conversation history: {e}, starting fresh")
+
+    def _save_history(self):
+        """
+        Save the current conversation history to disk.
+
+        This method saves the history to a JSON file using an atomic write
+        (write to temp file, then rename) to prevent corruption.
+        """
+        history_file = self._get_history_file_path()
+
+        try:
+            os.makedirs(os.path.dirname(history_file), exist_ok=True)
+
+            # Convert history to serializable format
+            history_data = [asdict(msg) for msg in self.history]
+
+            # Write to temporary file first (atomic write pattern)
+            temp_file = history_file + ".tmp"
+            with open(temp_file, "w") as f:
+                json.dump(history_data, f, indent=2)
+
+            # Rename temp file to actual file (atomic operation)
+            os.replace(temp_file, history_file)
+            logging.debug(f"Conversation history saved to {history_file}")
+
+        except Exception as e:
+            logging.error(f"Error saving conversation history: {e}")
 
     async def summarize_messages(self, messages: List[ChatMessage]) -> ChatMessage:
         """
@@ -239,6 +328,8 @@ class LLMHistoryManager:
                         del messages[:num_summarized]
                         messages.insert(0, summary_message)
                         logging.info("Successfully summarized the state")
+                        # Save history after summarization
+                        self._save_history()
                     elif (
                         summary_message.role == "system"
                         and "Error" in summary_message.content
@@ -362,6 +453,9 @@ class LLMHistoryManager:
                         )
 
                 self.history_manager.frame_index += 1
+
+                # Save conversation history to disk
+                self.history_manager._save_history()
 
                 return response
 
